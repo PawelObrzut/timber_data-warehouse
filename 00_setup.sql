@@ -1,30 +1,219 @@
---- =============
---- INITIAL SETUP
---- ENVIRONMENT: DEV
---- PROJECT: WOODWORKS DATA WAREHOUSE
---- =============
+
+-- =============
+-- INITIAL SETUP
+-- ENVIRONMENT: DEV
+-- PROJECT: WOODWORKS DATA WAREHOUSE
+-- =============
 
 CREATE DATABASE IF NOT EXISTS WOODWORKS_DB;
 USE DATABASE WOODWORKS_DB;
 
---- =============
---- MEDALION ARCHITECTURE
---- =============
+-- =============
+-- MEDALLION ARCHITECTURE
+-- =============
+
 CREATE SCHEMA IF NOT EXISTS BRONZE;
 CREATE SCHEMA IF NOT EXISTS SILVER;
 CREATE SCHEMA IF NOT EXISTS GOLD;
 
+-- =============
+-- PIPELINE MANAGEMENT
+-- =============
+
+CREATE SCHEMA IF NOT EXISTS CONTROL;
+
+USE SCHEMA CONTROL;
+
+-- =============
+-- PIPELINE CONFIGURATION
+-- =============
+
+CREATE TABLE IF NOT EXISTS WOODWORKS_DB.CONTROL.PIPELINE_CONFIG (
+    CONFIG_ID           NUMBER AUTOINCREMENT START 1 INCREMENT 1,
+    SOURCE_SYSTEM       VARCHAR(100) NOT NULL,
+    SOURCE_TABLE        VARCHAR(255) NOT NULL,
+    SOURCE_FILE         VARCHAR(500) NOT NULL,
+
+    LANDING_PATH        VARCHAR(1000) NOT NULL,
+
+    TARGET_SCHEMA       VARCHAR(100) DEFAULT 'BRONZE' NOT NULL,
+    TARGET_TABLE        VARCHAR(255) NOT NULL,
+
+    IS_ACTIVE           BOOLEAN DEFAULT TRUE NOT NULL,
+    LOAD_TYPE           VARCHAR(20) DEFAULT 'FULL' NOT NULL,
+
+    INCREMENTAL_COLUMN  VARCHAR(255),
+    PRIMARY_KEY_COLUMNS ARRAY,
+
+    DATE_COLUMN         VARCHAR(255),
+    DATE_FORMAT         VARCHAR(100),
+
+    ADDITIONAL_CONFIG   VARIANT,
+
+    CREATED_AT          TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    UPDATED_AT          TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+
+    CONSTRAINT PK_PIPELINE_CONFIG PRIMARY KEY (CONFIG_ID),
+    CONSTRAINT UQ_PIPELINE_CONFIG_SOURCE UNIQUE (SOURCE_SYSTEM, SOURCE_TABLE),
+
+    CONSTRAINT CHK_PIPELINE_LOAD_TYPE
+        CHECK (LOAD_TYPE IN ('FULL', 'INCREMENTAL', 'APPEND'))
+);
+
+
+-- =============
+-- PIPELINE CONFIGURATION SEED
+-- =============
+
+MERGE INTO WOODWORKS_DB.CONTROL.PIPELINE_CONFIG AS TARGET
+USING (
+    SELECT
+        COLUMN1 AS SOURCE_SYSTEM,
+        COLUMN2 AS SOURCE_TABLE,
+        COLUMN3 AS SOURCE_FILE,
+        COLUMN4 AS LANDING_PATH,
+        COLUMN5 AS TARGET_TABLE,
+        COLUMN6 AS DATE_COLUMN,
+        COLUMN7 AS DATE_FORMAT
+    FROM VALUES
+        (
+            'ANAPLAN',
+            'ANAPLAN_RMCPNL',
+            'timber_anaplan_rmcpnl.csv',
+            'ANAPLAN_RMCPNL/',
+            'ANAPLAN_RMCPNL',
+            'ETL_TIMESTAMP',
+            'YYYY-MM-DD HH24:MI:SS'
+        ),
+        (
+            'UNKNOWN',
+            'DELIVERY_NOTES',
+            'timber_delivery_notes_v3_carriers.csv',
+            'DELIVERY_NOTES/',
+            'DELIVERY_NOTES',
+            'DELIVERY_DATE',
+            'YYYY-MM-DD'
+        ),
+        (
+            'UNKNOWN',
+            'MIXDESIGN_COST_DAILY',
+            'timber_mixdesign_cost_daily.csv',
+            'MIXDESIGN_COST_DAILY/',
+            'MIXDESIGN_COST_DAILY',
+            'COST_DATE',
+            'YYYY-MM-DD'
+        ),
+        (
+            'SAP',
+            'SAP_CASH_CONTRACT',
+            'timber_sap_cash_contract_v2.csv',
+            'SAP_CASH_CONTRACT/',
+            'SAP_CASH_CONTRACT',
+            'ETL_TIMESTAMP',
+            'YYYY-MM-DD HH24:MI:SS'
+        ),
+        (
+            'SAP',
+            'SAP_INV_COST',
+            'timber_sap_inv_cost_v2_carriers.csv',
+            'SAP_INV_COST/',
+            'SAP_INV_COST',
+            'COST_DATE',
+            'YYYY-MM-DD'
+        ),
+        (
+            'SAP',
+            'SAP_INV_REV',
+            'timber_sap_inv_rev_v2.csv',
+            'SAP_INV_REV/',
+            'SAP_INV_REV',
+            'INVOICE_DATE',
+            'YYYY-MM-DD'
+        ),
+        (
+            'SALESFORCE',
+            'SF_ACCOUNT',
+            'timber_sf_account.csv',
+            'SF_ACCOUNT/',
+            'SF_ACCOUNT',
+            'ETL_TIMESTAMP',
+            'YYYY-MM-DD HH24:MI:SS'
+        ),
+        (
+            'SALESFORCE',
+            'SF_SUBSCRIPTION',
+            'timber_sf_subscription_c_v2.csv',
+            'SF_SUBSCRIPTION/',
+            'SF_SUBSCRIPTION',
+            'LASTMODIFIEDDATE',
+            'YYYY-MM-DD HH24:MI:SS'
+        )
+) AS SOURCE
+ON TARGET.SOURCE_SYSTEM = SOURCE.SOURCE_SYSTEM
+AND TARGET.SOURCE_TABLE = SOURCE.SOURCE_TABLE
+
+WHEN MATCHED THEN UPDATE SET
+    TARGET.SOURCE_FILE = SOURCE.SOURCE_FILE,
+    TARGET.LANDING_PATH = SOURCE.LANDING_PATH,
+    TARGET.TARGET_SCHEMA = 'BRONZE',
+    TARGET.TARGET_TABLE = SOURCE.TARGET_TABLE,
+    TARGET.DATE_COLUMN = SOURCE.DATE_COLUMN,
+    TARGET.DATE_FORMAT = SOURCE.DATE_FORMAT,
+    TARGET.LOAD_TYPE = 'APPEND',
+    TARGET.IS_ACTIVE = TRUE,
+    TARGET.UPDATED_AT = CURRENT_TIMESTAMP()
+
+WHEN NOT MATCHED THEN INSERT (
+    SOURCE_SYSTEM,
+    SOURCE_TABLE,
+    SOURCE_FILE,
+    LANDING_PATH,
+    TARGET_SCHEMA,
+    TARGET_TABLE,
+    IS_ACTIVE,
+    LOAD_TYPE,
+    DATE_COLUMN,
+    DATE_FORMAT,
+    PRIMARY_KEY_COLUMNS,
+    ADDITIONAL_CONFIG
+)
+VALUES (
+    SOURCE.SOURCE_SYSTEM,
+    SOURCE.SOURCE_TABLE,
+    SOURCE.SOURCE_FILE,
+    SOURCE.LANDING_PATH,
+    'BRONZE',
+    SOURCE.TARGET_TABLE,
+    TRUE,
+    'APPEND',
+    SOURCE.DATE_COLUMN,
+    SOURCE.DATE_FORMAT,
+    NULL,
+    NULL
+);
+
+-- Verify configuration
+SELECT *
+FROM WOODWORKS_DB.CONTROL.PIPELINE_CONFIG
+ORDER BY CONFIG_ID;
+
+-- =============
+-- CSV FILE FORMAT
+-- =============
+
 USE SCHEMA BRONZE;
 
---- =============
---- All source files comes in .csv format
---- =============
 CREATE FILE FORMAT IF NOT EXISTS TIMBER_CSV_FORMAT
     TYPE = CSV
     PARSE_HEADER = TRUE;
+
+-- =============
+-- COMPUTE WAREHOUSE
+-- =============
 
 CREATE WAREHOUSE IF NOT EXISTS WOODWORKS_WH
     WAREHOUSE_SIZE = 'X-SMALL'
     AUTO_SUSPEND = 60
     AUTO_RESUME = TRUE
     INITIALLY_SUSPENDED = TRUE;
+

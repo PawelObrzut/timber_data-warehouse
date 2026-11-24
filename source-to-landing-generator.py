@@ -5,19 +5,26 @@
 # Pipeline:
 # Azure source -> Download -> Validate -> Split -> Upload -> Snowpipe
 #
+# Configuration:
+# Snowflake CONTROL.PIPELINE_CONFIG
+#
 # Modes:
-#   INITIAL -> Full historical data, daily files
-#   DAILY   -> Reprocess last N calendar days
+# INITIAL -> Full historical data, daily files
+# DAILY   -> Reprocess last N calendar days
 # ============================================================
 
+import os
 from pathlib import Path
 from datetime import date, timedelta, datetime
 
 import pandas as pd
+import snowflake.connector
 
 from azure.identity import DefaultAzureCredential
 from azure.storage.blob import BlobServiceClient
+from dotenv import load_dotenv
 
+load_dotenv()
 
 # ============================================================
 # 1. GENERAL CONFIGURATION
@@ -29,7 +36,7 @@ SOURCE_CONTAINER = "source"
 LANDING_CONTAINER = "landing"
 
 SOURCE_DIR = Path("data/source")
-OUTPUT_DIR = Path("data/prepared")
+OUTPUT_DIR = Path("data/landing")
 
 MODE = "INITIAL"  # "INITIAL" or "DAILY"
 
@@ -40,50 +47,16 @@ UPLOAD_TO_AZURE = True
 
 
 # ============================================================
-# 2. SOURCE FILE CONFIGURATION
+# 2. SNOWFLAKE CONFIGURATION
 # ============================================================
 
-FILES_CONFIG = {
-    "timber_anaplan_rmcpnl.csv": {
-        "split_column": "ETL_TIMESTAMP",
-        "date_format": "%Y-%m-%d %H:%M:%S",
-        "landing_folder": "ANAPLAN_RMCPNL",
-    },
-    "timber_delivery_notes_v3_carriers.csv": {
-        "split_column": "DELIVERY_DATE",
-        "date_format": "%Y-%m-%d",
-        "landing_folder": "DELIVERY_NOTES",
-    },
-    "timber_mixdesign_cost_daily.csv": {
-        "split_column": "COST_DATE",
-        "date_format": "%Y-%m-%d",
-        "landing_folder": "MIXDESIGN_COST_DAILY",
-    },
-    "timber_sap_cash_contract_v2.csv": {
-        "split_column": "ETL_TIMESTAMP",
-        "date_format": "%Y-%m-%d %H:%M:%S",
-        "landing_folder": "SAP_CASH_CONTRACT",
-    },
-    "timber_sap_inv_cost_v2_carriers.csv": {
-        "split_column": "COST_DATE",
-        "date_format": "%Y-%m-%d",
-        "landing_folder": "SAP_INV_COST",
-    },
-    "timber_sap_inv_rev_v2.csv": {
-        "split_column": "INVOICE_DATE",
-        "date_format": "%Y-%m-%d",
-        "landing_folder": "SAP_INV_REV",
-    },
-    "timber_sf_account.csv": {
-        "split_column": "ETL_TIMESTAMP",
-        "date_format": "%Y-%m-%d %H:%M:%S",
-        "landing_folder": "SF_ACCOUNT",
-    },
-    "timber_sf_subscription_c_v2.csv": {
-        "split_column": "LASTMODIFIEDDATE",
-        "date_format": "%Y-%m-%d %H:%M:%S",
-        "landing_folder": "SF_SUBSCRIPTION",
-    },
+SNOWFLAKE_CONFIG = {
+    "account": os.getenv("SNOWFLAKE_ACCOUNT"),
+    "user": os.getenv("SNOWFLAKE_USER"),
+    "password": os.getenv("SNOWFLAKE_PASSWORD"),
+    "warehouse": "WOODWORKS_WH",
+    "database": "WOODWORKS_DB",
+    "schema": "CONTROL",
 }
 
 
@@ -103,7 +76,6 @@ run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 if MODE == "INITIAL":
     date_from = None
     date_to = None
-
 else:
     date_from = today - timedelta(days=REPROCESS_DAYS - 1)
     date_to = today
@@ -113,7 +85,113 @@ RUN_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ============================================================
-# 4. AZURE CONNECTION
+# 4. DATE FORMAT CONVERSION
+# ============================================================
+
+# Snowflake date formats -> Python/Pandas date formats
+
+DATE_FORMAT_MAPPING = {
+    "YYYY-MM-DD": "%Y-%m-%d",
+    "YYYY-MM-DD HH24:MI:SS": "%Y-%m-%d %H:%M:%S",
+}
+
+
+def convert_date_format(snowflake_format):
+    """
+    Convert Snowflake date format into Python/Pandas format.
+    """
+
+    if snowflake_format not in DATE_FORMAT_MAPPING:
+        raise ValueError(
+            f"Unsupported Snowflake date format: {snowflake_format}"
+        )
+
+    return DATE_FORMAT_MAPPING[snowflake_format]
+
+
+# ============================================================
+# 5. GET PIPELINE CONFIGURATION FROM SNOWFLAKE
+# ============================================================
+
+def get_pipeline_config():
+    """
+    Fetch active pipeline configurations from Snowflake.
+    """
+
+    missing_settings = [
+        key
+        for key, value in SNOWFLAKE_CONFIG.items()
+        if key in ("account", "user", "password") and not value
+    ]
+
+    if missing_settings:
+        raise ValueError(
+            "Missing Snowflake environment variables: "
+            + ", ".join(missing_settings)
+        )
+
+    connection = None
+
+    query = """
+        SELECT
+            SOURCE_SYSTEM,
+            SOURCE_TABLE,
+            SOURCE_FILE,
+            LANDING_PATH,
+            TARGET_SCHEMA,
+            TARGET_TABLE,
+            IS_ACTIVE,
+            LOAD_TYPE,
+            INCREMENTAL_COLUMN,
+            PRIMARY_KEY_COLUMNS,
+            DATE_COLUMN,
+            DATE_FORMAT,
+            ADDITIONAL_CONFIG
+        FROM WOODWORKS_DB.CONTROL.PIPELINE_CONFIG
+        WHERE IS_ACTIVE = TRUE
+        ORDER BY CONFIG_ID;
+    """
+
+    try:
+        connection = snowflake.connector.connect(
+            **SNOWFLAKE_CONFIG
+        )
+
+        cursor = connection.cursor(
+            snowflake.connector.DictCursor
+        )
+
+        try:
+            cursor.execute(query)
+            configurations = cursor.fetchall()
+        finally:
+            cursor.close()
+
+        if not configurations:
+            raise ValueError(
+                "No active pipeline configurations found "
+                "in WOODWORKS_DB.CONTROL.PIPELINE_CONFIG."
+            )
+
+        print(
+            f"Loaded {len(configurations)} pipeline "
+            "configurations from Snowflake."
+        )
+
+        return configurations
+
+    except Exception as error:
+        raise RuntimeError(
+            f"Failed to fetch pipeline configuration: {error}"
+        ) from error
+
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+# ============================================================
+# 6. AZURE CONNECTION
 # ============================================================
 
 credential = DefaultAzureCredential()
@@ -129,10 +207,10 @@ blob_service_client = BlobServiceClient(
 
 
 # ============================================================
-# 5. DOWNLOAD SOURCE FILES FROM AZURE
+# 7. DOWNLOAD SOURCE FILES FROM AZURE
 # ============================================================
 
-def download_sources_from_azure():
+def download_sources_from_azure(configurations):
 
     print("\n" + "=" * 60)
     print("DOWNLOADING SOURCE FILES FROM AZURE")
@@ -146,7 +224,9 @@ def download_sources_from_azure():
 
     missing_blobs = []
 
-    for file_name in FILES_CONFIG:
+    for config in configurations:
+
+        file_name = config["SOURCE_FILE"]
 
         blob_client = source_container.get_blob_client(file_name)
 
@@ -166,7 +246,6 @@ def download_sources_from_azure():
         print(f"Downloaded: {file_name}")
 
     if missing_blobs:
-
         raise FileNotFoundError(
             "Missing Azure source blobs: "
             + ", ".join(missing_blobs)
@@ -174,10 +253,10 @@ def download_sources_from_azure():
 
 
 # ============================================================
-# 6. VALIDATE LOCAL SOURCE FILES
+# 8. VALIDATE LOCAL SOURCE FILES
 # ============================================================
 
-def validate_source_files():
+def validate_source_files(configurations):
 
     print("\n" + "=" * 60)
     print("VALIDATING SOURCE FILES")
@@ -186,7 +265,10 @@ def validate_source_files():
     missing_files = []
     missing_columns = []
 
-    for file_name, settings in FILES_CONFIG.items():
+    for config in configurations:
+
+        file_name = config["SOURCE_FILE"]
+        date_column = config["DATE_COLUMN"]
 
         source_path = SOURCE_DIR / file_name
 
@@ -194,8 +276,6 @@ def validate_source_files():
             missing_files.append(file_name)
             print(f"MISSING FILE: {file_name}")
             continue
-
-        date_column = settings["split_column"]
 
         source_columns = pd.read_csv(
             source_path,
@@ -218,6 +298,9 @@ def validate_source_files():
             print(
                 f"OK: {file_name} -> {date_column}"
             )
+
+        # Validate configured date format.
+        convert_date_format(config["DATE_FORMAT"])
 
     if missing_files or missing_columns:
 
@@ -242,19 +325,23 @@ def validate_source_files():
 
 
 # ============================================================
-# 7. LOAD, PARSE AND VALIDATE DATA
+# 9. LOAD, PARSE AND VALIDATE DATA
 # ============================================================
 
-def load_source_data():
+def load_source_data(configurations):
 
     loaded_data = {}
 
-    for file_name, settings in FILES_CONFIG.items():
+    for config in configurations:
+
+        file_name = config["SOURCE_FILE"]
+        date_column = config["DATE_COLUMN"]
+
+        date_format = convert_date_format(
+            config["DATE_FORMAT"]
+        )
 
         source_path = SOURCE_DIR / file_name
-
-        date_column = settings["split_column"]
-        date_format = settings["date_format"]
 
         data = pd.read_csv(source_path)
 
@@ -285,10 +372,10 @@ def load_source_data():
 
 
 # ============================================================
-# 8. GENERATE DAILY CSV FILES
+# 10. GENERATE DAILY CSV FILES
 # ============================================================
 
-def generate_daily_files(loaded_data):
+def generate_daily_files(loaded_data, configurations):
 
     print("\n" + "=" * 60)
     print("GENERATING DAILY FILES")
@@ -296,15 +383,26 @@ def generate_daily_files(loaded_data):
 
     export_summary = {}
 
+    # Index configurations by source file name.
+    config_by_file = {
+        config["SOURCE_FILE"]: config
+        for config in configurations
+    }
+
     for file_name, data in loaded_data.items():
 
-        settings = FILES_CONFIG[file_name]
+        config = config_by_file[file_name]
 
-        date_column = settings["split_column"]
-        date_format = settings["date_format"]
-        landing_folder = settings["landing_folder"]
+        date_column = config["DATE_COLUMN"]
 
-        # DAILY: filter last N calendar days
+        date_format = convert_date_format(
+            config["DATE_FORMAT"]
+        )
+
+        # Remove trailing slash from landing path.
+        landing_folder = config["LANDING_PATH"].strip("/")
+
+        # DAILY: filter last N calendar days.
         if MODE == "DAILY":
 
             data = data.loc[
@@ -382,10 +480,10 @@ def generate_daily_files(loaded_data):
 
 
 # ============================================================
-# 9. UPLOAD DAILY FILES TO AZURE LANDING
+# 11. UPLOAD DAILY FILES TO AZURE LANDING
 # ============================================================
 
-def upload_to_azure():
+def upload_to_azure(configurations):
 
     print("\n" + "=" * 60)
     print("UPLOADING FILES TO AZURE LANDING")
@@ -399,9 +497,9 @@ def upload_to_azure():
 
     uploaded_files = 0
 
-    for file_name, settings in FILES_CONFIG.items():
+    for config in configurations:
 
-        landing_folder = settings["landing_folder"]
+        landing_folder = config["LANDING_PATH"].strip("/")
 
         local_folder = (
             RUN_OUTPUT_DIR / landing_folder
@@ -443,7 +541,7 @@ def upload_to_azure():
 
 
 # ============================================================
-# 10. MAIN PIPELINE
+# 12. MAIN PIPELINE
 # ============================================================
 
 def main():
@@ -462,28 +560,36 @@ def main():
             f"Date range: {date_from} -> {date_to}"
         )
 
-    # Step 1: Download
-    if DOWNLOAD_FROM_AZURE:
-        download_sources_from_azure()
+    # Step 1: Get configuration from Snowflake.
+    configurations = get_pipeline_config()
 
-    # Step 2: Validate
-    validate_source_files()
-
-    # Step 3: Load data
-    loaded_data = load_source_data()
-
-    # Step 4: Generate daily CSV files
-    export_summary = generate_daily_files(
-        loaded_data
+    print(
+        f"\nActive source files: {len(configurations)}"
     )
 
-    # Step 5: Upload only after successful generation
+    # Step 2: Download.
+    if DOWNLOAD_FROM_AZURE:
+        download_sources_from_azure(configurations)
+
+    # Step 3: Validate.
+    validate_source_files(configurations)
+
+    # Step 4: Load data.
+    loaded_data = load_source_data(configurations)
+
+    # Step 5: Generate daily CSV files.
+    export_summary = generate_daily_files(
+        loaded_data,
+        configurations
+    )
+
+    # Step 6: Upload only after successful generation.
     uploaded_files = 0
 
     if UPLOAD_TO_AZURE:
-        uploaded_files = upload_to_azure()
+        uploaded_files = upload_to_azure(configurations)
 
-    # Step 6: Final summary
+    # Step 7: Final summary.
     total_rows = sum(
         item["rows"]
         for item in export_summary.values()
@@ -520,8 +626,19 @@ def main():
 
 
 # ============================================================
-# 11. EXECUTE
+# 13. EXECUTE
 # ============================================================
 
+# if __name__ == "__main__":
+#    main()
+
 if __name__ == "__main__":
-    main()
+    configurations = get_pipeline_config()
+
+    download_sources_from_azure(configurations)
+    validate_source_files(configurations)
+
+    loaded_data = load_source_data(configurations)
+    generate_daily_files(loaded_data, configurations)
+
+    upload_to_azure(configurations)
